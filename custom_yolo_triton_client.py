@@ -145,6 +145,13 @@ class YoloTritonClient:
             print("Disconnected")
 
     async def _preprocess(self, img: np.ndarray):
+        """
+        Метод для предобработки массива:
+        - resize(self.input_width, self.input_height)
+        - BGR -> RGB
+        - HWC -> CHW
+        - нормализация
+        """
 
         img = cv2.resize(img, (self.input_width, self.input_height))
 
@@ -225,7 +232,7 @@ class YoloTritonClient:
             input_batch: List[str] список путей к изображениям
 
         Returns:
-            Массив детекций List[YOLOBaseOut]
+            out: Массив детекций List[YOLOBaseOut]
 
         """
         if len(input_batch) > self.max_batch_size:
@@ -288,6 +295,19 @@ class YoloTritonClient:
     
 
     async def _postprocess(self, output_data: np.ndarray):
+        """
+        Постобработка выхода модели: 
+        - вставка id (нет трекера)
+        - фильтрация по confidence
+        - клип по размерам изображения
+
+        Args:
+            output_data: np.ndarray выход модели
+        
+        Returns:
+            data_filtered_by_confs: np.ndarray массив,
+            отфильтрованный и подготовленный к YOLOBaseOut
+        """
         data_with_ids = np.insert(output_data, 4, np.array([-1] *  output_data.shape[0]), axis=1)
 
         confs_mask = data_with_ids[..., 5] > self.confidence_threshold
