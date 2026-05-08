@@ -154,20 +154,6 @@ class YoloTritonClient:
 
         return img.astype(np.float32)
 
-    async def _postprocess(self, output_data: np.ndarray):
-        data_with_ids = np.insert(output_data, 4, np.array([-1] *  output_data.shape[0]), axis=1)
-
-        confs_mask = data_with_ids[..., 5] > self.confidence_threshold
-
-        data_filtered_by_confs = data_with_ids[confs_mask]
-
-        data_filtered_by_confs[:, [0, 2]] = np.clip(data_filtered_by_confs[:, [0, 2]], 0, self.input_width)
-        data_filtered_by_confs[:, [1, 3]] = np.clip(data_filtered_by_confs[:, [1, 3]], 0, self.input_height)
-
-        return data_filtered_by_confs
-
-
-
     async def infer_image(self, input_image_path: str):
         """
         Инференс из уже подготовленного тензора.
@@ -190,6 +176,14 @@ class YoloTritonClient:
         original_height, original_width = img.shape[:2]
         
         input_tensor = await self._preprocess(img)
+
+        actual_input_byte_size = input_tensor.nbytes
+
+        if actual_input_byte_size > self.input_byte_size:
+            raise RuntimeError(
+                f"Batch data size {actual_input_byte_size} bytes exeeds shared memory size {self.input_byte_size} bytes. "
+                f"Batch shape: {input_tensor.shape}, max expected: ({self.max_batch_size}, 3, {self.input_height}, {self.input_width})"
+            )
 
         shm.set_shared_memory_region(self.shm_ip_handle, [input_tensor])
 
@@ -234,6 +228,9 @@ class YoloTritonClient:
             Массив детекций List[YOLOBaseOut]
 
         """
+        if len(input_batch) > self.max_batch_size:
+            raise ValueError(f"Batch size {len(input_batch)} exceeds {self.max_batch_size}")
+        
         original_shapes = []
         images_tensors = []
         for path in input_batch:
@@ -246,13 +243,22 @@ class YoloTritonClient:
             original_shapes.append(original_shape)
         batch_tensor = np.stack(images_tensors, axis=0)
 
+        actual_input_byte_size = batch_tensor.nbytes
+
+        if actual_input_byte_size > self.input_byte_size:
+            raise RuntimeError(
+                f"Batch data size {actual_input_byte_size} bytes exeeds shared memory size {self.input_byte_size} bytes. "
+                f"Batch shape: {batch_tensor.shape}, max expected: ({self.max_batch_size}, 3, {self.input_height}, {self.input_width})"
+            )
+
         shm.set_shared_memory_region(self.shm_ip_handle, [batch_tensor])
 
         inputs = []
         inputs.append(
             grpcclient.InferInput(self.input_name, batch_tensor.shape, "FP32")
         )
-        inputs[-1].set_shared_memory(f"{self.model_name}_input", int(batch_tensor.nbytes))
+        
+        inputs[-1].set_shared_memory(f"{self.model_name}_input", self.input_byte_size)
 
         outputs = []
         outputs.append(grpcclient.InferRequestedOutput(self.output_name))
@@ -279,6 +285,19 @@ class YoloTritonClient:
             YOLOBaseOut(data= await self._postprocess(det), orig_shape=original_shape)
             for det, original_shape in zip(output_data, original_shapes)
         ]
+    
+
+    async def _postprocess(self, output_data: np.ndarray):
+        data_with_ids = np.insert(output_data, 4, np.array([-1] *  output_data.shape[0]), axis=1)
+
+        confs_mask = data_with_ids[..., 5] > self.confidence_threshold
+
+        data_filtered_by_confs = data_with_ids[confs_mask]
+
+        data_filtered_by_confs[:, [0, 2]] = np.clip(data_filtered_by_confs[:, [0, 2]], 0, self.input_width)
+        data_filtered_by_confs[:, [1, 3]] = np.clip(data_filtered_by_confs[:, [1, 3]], 0, self.input_height)
+
+        return data_filtered_by_confs
 
 
 FLAGS = None
@@ -377,7 +396,6 @@ async def main():
             print(detections.bboxes.xywh)
             print(detections.old_format)
             print(detections.confs)
-
     finally:
         await client.disconnect()
 
