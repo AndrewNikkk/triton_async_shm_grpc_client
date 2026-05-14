@@ -1,8 +1,6 @@
 import argparse
 import asyncio as aio
 import sys
-from builtins import range
-from ctypes import *
 from typing import Any, List, Optional
 
 import cv2  # type: ignore
@@ -26,7 +24,7 @@ class YoloTritonClient:
         input_width: int = 640,
         input_height: int = 640,
         max_detections: int = 300,
-        confidence_threshold: float = 0.5,
+        confidence_threshold: float = 0.8,
         verbose: bool = False,
     ):
         """
@@ -71,9 +69,26 @@ class YoloTritonClient:
         self.shm_op_handle: Any = None
         self._is_connected = False
 
-    # Метод для подключения к серверу Triton
+    async def __aenter__(self):
+        """
+        Асинхронный вход в контекст
+        """
+        await self.connect()
+        return self
+
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """
+        Асинхронный выход из контекста
+        """
+
+        await self.disconnect()
+        return False
 
     async def connect(self):
+        """
+        Подключение к Triton Inference Server
+        """
         if self._is_connected:
             if self.verbose:
                 print("Already connected, skipping")
@@ -118,7 +133,6 @@ class YoloTritonClient:
         if self.verbose:
             print(f"Connected to {self.url}, model: {self.model_name}")
 
-    # Метод для отключения от сервера Triton
 
     async def disconnect(self) -> None:
         """
@@ -144,6 +158,7 @@ class YoloTritonClient:
         if self.verbose:
             print("Disconnected")
 
+
     async def _preprocess(self, img: np.ndarray):
         """
         Метод для предобработки массива:
@@ -151,6 +166,12 @@ class YoloTritonClient:
         - BGR -> RGB
         - HWC -> CHW
         - нормализация
+
+        Args:
+            img: np.ndarray массив изображения
+
+        Returns:
+            img.astype(np.float): массив обработанного изображения
         """
 
         img = cv2.resize(img, (self.input_width, self.input_height))
@@ -161,86 +182,31 @@ class YoloTritonClient:
 
         return img.astype(np.float32)
 
-    async def infer_image(self, input_image_path: str):
+   
+    async def infer(self, input_imgs: List[str]):
         """
-        Инференс из уже подготовленного тензора.
+        Метод для инференса с выходом YOLOBaseOut
 
         Args:
-            input_image_path: путь к изображению
-
-        Returns:
-            Массив детекций формы (max_detections, 6)
-        """
-        if not self._is_connected:
-            raise RuntimeError(
-                "Client not connected. Call connect() first ot use asyc with"
-            )
-        
-        img = cv2.imread(input_image_path)
-        if img is None:
-            raise FileNotFoundError(f"Could not load image: {input_image_path}")
-        
-        original_height, original_width = img.shape[:2]
-        
-        input_tensor = await self._preprocess(img)
-
-        actual_input_byte_size = input_tensor.nbytes
-
-        if actual_input_byte_size > self.input_byte_size:
-            raise RuntimeError(
-                f"Batch data size {actual_input_byte_size} bytes exeeds shared memory size {self.input_byte_size} bytes. "
-                f"Batch shape: {input_tensor.shape}, max expected: ({self.max_batch_size}, 3, {self.input_height}, {self.input_width})"
-            )
-
-        shm.set_shared_memory_region(self.shm_ip_handle, [input_tensor])
-
-        inputs = []
-        inputs.append(grpcclient.InferInput(self.input_name, input_tensor.shape, "FP32"))
-        inputs[-1].set_shared_memory(f"{self.model_name}_input", self.input_byte_size)
-
-        outputs = []
-        outputs.append(grpcclient.InferRequestedOutput(self.output_name))
-        outputs[-1].set_shared_memory(
-            f"{self.model_name}_output", self.output_byte_size
-        )
-
-        results = await self.client.infer(
-            model_name=self.model_name, inputs=inputs, outputs=outputs
-        )
-
-        output_meta = results.get_output(self.output_name)
-        if output_meta is None:
-            raise RuntimeError(f"Output '{self.output_name}' not found in response")
-
-        output_data = shm.get_contents_as_numpy(
-            self.shm_op_handle,
-            utils.triton_to_np_dtype(output_meta.datatype),
-            output_meta.shape,
-        )[0]
-
-        data_with_ids = await self._postprocess(output_data)
-
-        out = YOLOBaseOut(orig_shape=(original_height, original_width), data=data_with_ids)
-
-        return out
-
-    async def infer_batch(self, input_batch: List[str]):
-        """
-        Метод для инференса батча с выходом YOLOBaseOut
-
-        Args:
-            input_batch: List[str] список путей к изображениям
+            input: List[str] список путей к изображениям
 
         Returns:
             out: Массив детекций List[YOLOBaseOut]
 
         """
-        if len(input_batch) > self.max_batch_size:
-            raise ValueError(f"Batch size {len(input_batch)} exceeds {self.max_batch_size}")
+        if not self._is_connected:
+            raise RuntimeError("Client not connected. Call connect() first")
+        
+        if not input_imgs:
+            raise ValueError("Empty image list provided")
+
+
+        if len(input_imgs) > self.max_batch_size:
+            raise ValueError(f"Batch size {len(input_imgs)} exceeds {self.max_batch_size}")
         
         original_shapes = []
         images_tensors = []
-        for path in input_batch:
+        for path in input_imgs:
             img = cv2.imread(path)
             if img is None:
                 raise ValueError(f"Couldn't load image: {path}")
@@ -305,19 +271,19 @@ class YoloTritonClient:
             output_data: np.ndarray выход модели
         
         Returns:
-            data_filtered_by_confs: np.ndarray массив,
+            data_with_ids: np.ndarray массив,
             отфильтрованный и подготовленный к YOLOBaseOut
         """
-        data_with_ids = np.insert(output_data, 4, np.array([-1] *  output_data.shape[0]), axis=1)
+        confs_mask = output_data[..., 4] > self.confidence_threshold
 
-        confs_mask = data_with_ids[..., 5] > self.confidence_threshold
-
-        data_filtered_by_confs = data_with_ids[confs_mask]
+        data_filtered_by_confs = output_data[confs_mask]
 
         data_filtered_by_confs[:, [0, 2]] = np.clip(data_filtered_by_confs[:, [0, 2]], 0, self.input_width)
         data_filtered_by_confs[:, [1, 3]] = np.clip(data_filtered_by_confs[:, [1, 3]], 0, self.input_height)
+        data_with_ids = np.insert(data_filtered_by_confs, 4, np.array([-1] *  data_filtered_by_confs.shape[0]), axis=1)
 
-        return data_filtered_by_confs
+
+        return data_with_ids
 
 
 FLAGS = None
@@ -391,33 +357,18 @@ async def main():
         verbose=FLAGS.verbose,
     )
 
-    try:
-        await client.connect()
-
-        image_paths = FLAGS.path_to_image
-        if len(image_paths) > 1:
-            detections = await client.infer_batch(image_paths)
-            for i in range(len(image_paths)):
-                print(detections[i].classes)
-                print(detections[i].ids)
-                print(detections[i].bboxes.xyxy)
-                print(detections[i].bboxes.xyxyn)
-                print(detections[i].bboxes.xywh)
-                print(detections[i].old_format)
-                print(detections[i].confs)
-                print("\n============================\n")
-        else:
-            detections = await client.infer_image(image_paths[0])
-
-            print(detections.classes)
-            print(detections.ids)
-            print(detections.bboxes.xyxy)
-            print(detections.bboxes.xyxyn)
-            print(detections.bboxes.xywh)
-            print(detections.old_format)
-            print(detections.confs)
-    finally:
-        await client.disconnect()
+    async with client:        
+        detections = await client.infer(FLAGS.path_to_image)
+        
+        for i, detection in enumerate(detections):
+            print(f"\n{'='*20} Image {i+1} {'='*20}")
+            print(f"Classes: {detection.classes}")
+            print(f"IDs: {detection.ids}")
+            print(f"BBoxes XYXY: {detection.bboxes.xyxy}")
+            print(f"BBoxes XYXY norm: {detection.bboxes.xyxyn}")
+            print(f"BBoxes XYWH: {detection.bboxes.xywh}")
+            print(f"Old format: {detection.old_format}")
+            print(f"Confidences: {detection.confs}")
 
 
 if __name__ == "__main__":
