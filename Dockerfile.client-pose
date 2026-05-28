@@ -1,0 +1,23 @@
+# Client image for custom_yolo_triton_client.py
+#
+# If you use system shared memory against Triton in another container, share IPC, e.g.:
+#   docker run --rm --ipc=container:<triton_container_name> ...
+# or both use --ipc=host (Linux). Otherwise use -u host.docker.internal:8001 and expect SHM issues across separate IPC namespaces.
+
+FROM python:3.12-slim
+
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir --retries 20 --timeout 600 \
+    "tritonclient[grpc]>=2.40" \
+    "numpy>=1.26,<3"
+
+RUN pip install --no-cache-dir --retries 20 --timeout 600 \
+    "opencv-python-headless>=4.8.0"
+
+WORKDIR /app
+COPY triton_client_base.py /app/
+COPY yolo_triton_client_base.py /app/
+COPY yolo_triton_client_pose.py /app/
+COPY yolo.py /app/
+
+ENTRYPOINT ["python", "/app/yolo_triton_client_pose.py"]
